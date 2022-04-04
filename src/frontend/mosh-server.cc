@@ -46,6 +46,7 @@
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <pwd.h>
 #include <typeinfo>
 #include <signal.h>
@@ -95,14 +96,15 @@
 typedef Network::Transport< Terminal::Complete, Network::UserStream > ServerConnection;
 
 static void serve( int host_fd,
-		   Terminal::Complete &terminal,
-		   ServerConnection &network,
-		   long network_timeout,
-		   long network_signaled_timeout );
+       Terminal::Complete &terminal,
+       ServerConnection &network,
+       long network_timeout,
+       long network_signaled_timeout );
 
 static int run_server( const char *desired_ip, const char *desired_port,
-		       const string &command_path, char *command_argv[],
-		       const int colors, unsigned int verbose, bool with_motd );
+           const string &command_path, char *command_argv[],
+           const int colors, unsigned int verbose, bool with_motd,
+           bool background );
 
 using namespace std;
 
@@ -115,7 +117,7 @@ static void print_version( FILE *file )
 
 static void print_usage( FILE *stream, const char *argv0 )
 {
-  fprintf( stream, "Usage: %s new [-s] [-v] [-i LOCALADDR] [-p PORT[:PORT2]] [-c COLORS] [-l NAME=VALUE] [-- COMMAND...]\n", argv0 );
+  fprintf( stream, "Usage: %s new [-s] [-v] [-f] [-i LOCALADDR] [-p PORT[:PORT2]] [-c COLORS] [-l NAME=VALUE] [-- COMMAND...]\n", argv0 );
 }
 
 static bool print_motd( const char *filename );
@@ -178,6 +180,7 @@ int main( int argc, char *argv[] )
   string command_path;
   char **command_argv = NULL;
   int colors = 0;
+  bool background = true;
   unsigned int verbose = 0; /* don't close stdin/stdout/stderr */
   /* Will cause mosh-server not to correctly detach on old versions of sshd. */
   list<string> locale_vars;
@@ -194,7 +197,7 @@ int main( int argc, char *argv[] )
     }
     if ( 0 == strcmp( argv[ i ], "--" ) ) { /* -- is mandatory */
       if ( i != argc - 1 ) {
-	command_argv = argv + i + 1;
+				command_argv = argv + i + 1;
       }
       argc = i; /* rest of options before -- */
       break;
@@ -206,50 +209,54 @@ int main( int argc, char *argv[] )
        && (strcmp( argv[ 1 ], "new" ) == 0) ) {
     /* new option syntax */
     int opt;
-    while ( (opt = getopt( argc - 1, argv + 1, "@:i:p:c:svl:" )) != -1 ) {
+    while ( (opt = getopt( argc - 1, argv + 1, "@:i:p:c:svfl:" )) != -1 ) {
       switch ( opt ) {
-	/*
-	 * This undocumented option does nothing but eat its argument.
-	 * Useful in scripting where you prepend something to a
-	 * mosh-server argv, and might end up with something like
-	 * "mosh-server new -v new -c 256", now you can say
-	 * "mosh-server new -v -@ new -c 256" to discard the second
-	 * "new".
-	 */
+  /*
+   * This undocumented option does nothing but eat its argument.
+   * Useful in scripting where you prepend something to a
+   * mosh-server argv, and might end up with something like
+   * "mosh-server new -v new -c 256", now you can say
+   * "mosh-server new -v -@ new -c 256" to discard the second
+   * "new".
+   */
       case '@':
-	break;
+  break;
       case 'i':
-	desired_ip = optarg;
-	break;
+  desired_ip = optarg;
+  break;
       case 'p':
-	desired_port = optarg;
-	break;
+  desired_port = optarg;
+  break;
       case 's':
-	desired_ip = NULL;
-	desired_ip_str = get_SSH_IP();
-	if ( !desired_ip_str.empty() ) {
-	  desired_ip = desired_ip_str.c_str();
-	  fatal_assert( desired_ip );
-	}
-	break;
+  desired_ip = NULL;
+  desired_ip_str = get_SSH_IP();
+  if ( !desired_ip_str.empty() ) {
+    desired_ip = desired_ip_str.c_str();
+    fatal_assert( desired_ip );
+  }
+  break;
       case 'c':
-	try {
-	  colors = myatoi( optarg );
-	} catch ( const CryptoException & ) {
-	  fprintf( stderr, "%s: Bad number of colors (%s)\n", argv[ 0 ], optarg );
-	  print_usage( stderr, argv[ 0 ] );
-	  exit( 1 );
-	}
-	break;
+  try {
+    colors = myatoi( optarg );
+  } catch ( const CryptoException & ) {
+    fprintf( stderr, "%s: Bad number of colors (%s)\n", argv[ 0 ], optarg );
+    print_usage( stderr, argv[ 0 ] );
+    exit( 1 );
+  }
+  break;
       case 'v':
-	verbose++;
-	break;
+  verbose++;
+  break;
+      case 'f':
+  fprintf( stderr, "foreground option\n");
+        background = false;
+  break;
       case 'l':
-	locale_vars.push_back( string( optarg ) );
-	break;
+  locale_vars.push_back( string( optarg ) );
+  break;
       default:
-	print_usage( stderr, argv[ 0 ] );
-	/* don't die on unknown options */
+  print_usage( stderr, argv[ 0 ] );
+  /* don't die on unknown options */
       }
     }
   } else if ( argc == 1 ) {
@@ -284,8 +291,8 @@ int main( int argc, char *argv[] )
     if ( shell == NULL ) {
       struct passwd *pw = getpwuid( getuid() );
       if ( pw == NULL ) {
-	perror( "getpwuid" );
-	exit( 1 );
+				perror( "getpwuid" );
+				exit( 1 );
       }
       shell = pw->pw_shell;
     }
@@ -305,7 +312,7 @@ int main( int argc, char *argv[] )
     }
 
     /* prepend '-' to make login shell */
-    shell_name = '-' + shell_name;
+    //shell_name = '-' + shell_name;
 
     my_argv[ 0 ] = const_cast<char *>( shell_name.c_str() );
     my_argv[ 1 ] = NULL;
@@ -328,12 +335,12 @@ int main( int argc, char *argv[] )
     /* apply locale-related environment variables from client */
     clear_locale_variables();
     for ( list<string>::const_iterator i = locale_vars.begin();
-	  i != locale_vars.end();
-	  i++ ) {
+    i != locale_vars.end();
+    i++ ) {
       char *env_string = strdup( i->c_str() );
       fatal_assert( env_string );
       if ( 0 != putenv( env_string ) ) {
-	perror( "putenv" );
+				perror( "putenv" );
       }
     }
 
@@ -352,21 +359,43 @@ int main( int argc, char *argv[] )
   }
 
   try {
-    return run_server( desired_ip, desired_port, command_path, command_argv, colors, verbose, with_motd );
+    return run_server( desired_ip, desired_port, command_path, command_argv, colors, verbose, with_motd, background );
   } catch ( const Network::NetworkException &e ) {
     fprintf( stderr, "Network exception: %s\n",
-	     e.what() );
+       e.what() );
     return 1;
   } catch ( const Crypto::CryptoException &e ) {
     fprintf( stderr, "Crypto exception: %s\n",
-	     e.what() );
+       e.what() );
     return 1;
   }
 }
 
+static void sigreap(int signo) {
+  char msg[128] = "";
+  int child_pid = -1;
+  int wstatus = 0;
+  while ((child_pid = waitpid(-1, &wstatus, WNOHANG)) > 0) {
+    if (WIFEXITED(wstatus)) {
+      snprintf(msg, sizeof(msg), "Reaping child PID %d, exited, status=%d\n", child_pid, WEXITSTATUS(wstatus));
+    } else if (WIFSIGNALED(wstatus)) {
+      snprintf(msg, sizeof(msg), "Reaping child PID %d, killed by signal %d\n", child_pid, WTERMSIG(wstatus));
+    } else if (WIFSTOPPED(wstatus)) {
+      snprintf(msg, sizeof(msg), "Reaping child PID %d, stopped by signal %d\n", child_pid, WSTOPSIG(wstatus));
+    } else if (WIFCONTINUED(wstatus)) {
+      snprintf(msg, sizeof(msg), "Reaping child PID %d, continued\n", child_pid);
+    }
+    psignal(signo, msg);
+    //sleep(3);
+    // Seems to cause mosh-client to hang
+    exit(0);
+  }
+}
+
 static int run_server( const char *desired_ip, const char *desired_port,
-		       const string &command_path, char *command_argv[],
-		       const int colors, unsigned int verbose, bool with_motd ) {
+           const string &command_path, char *command_argv[],
+           const int colors, unsigned int verbose, bool with_motd,
+           bool background ) {
   /* get network idle timeout */
   long network_timeout = 0;
   char *timeout_envar = getenv( "MOSH_SERVER_NETWORK_TMOUT" );
@@ -435,6 +464,13 @@ static int run_server( const char *desired_ip, const char *desired_port,
   fatal_assert( 0 == sigaction( SIGHUP, &sa, NULL ) );
   fatal_assert( 0 == sigaction( SIGPIPE, &sa, NULL ) );
 
+  /* Reap Children Processes */
+  struct sigaction sa_reap;
+  sa_reap.sa_handler = sigreap;
+  sa_reap.sa_flags = SA_NOCLDSTOP;
+  fatal_assert( 0 == sigfillset( &sa_reap.sa_mask ) );
+  fatal_assert( 0 == sigaction( SIGCHLD, &sa_reap, NULL) );
+
 
   /* detach from terminal */
   fflush( stdout );
@@ -460,7 +496,16 @@ static int run_server( const char *desired_ip, const char *desired_port,
     if ( isatty( STDERR_FILENO ) ) {
       tcdrain( STDERR_FILENO );
     }
-    _exit( 0 );
+    if ( background ) {
+      fprintf( stderr, "Backgrounding...\n");
+      _exit( 0 );
+    } else {
+      fprintf( stderr, "Pausing...\n");
+      for (;;)
+        pause();
+      fprintf( stderr, "Error: infinite loop terminated\n");
+      return 42;
+    }
   }
 
   int master;
@@ -510,6 +555,7 @@ static int run_server( const char *desired_ip, const char *desired_port,
     fatal_assert( 0 == sigfillset( &sa.sa_mask ) );
     fatal_assert( 0 == sigaction( SIGHUP, &sa, NULL ) );
     fatal_assert( 0 == sigaction( SIGPIPE, &sa, NULL ) );
+    fatal_assert( 0 == sigaction( SIGCHLD, &sa, NULL ) );
 
     /* close server-related file descriptors */
     delete network;
@@ -563,7 +609,7 @@ static int run_server( const char *desired_ip, const char *desired_port,
       // XXX Hackish knowledge of Ubuntu PAM configuration.
       // But this seems less awful than build-time detection with autoconf.
       if (!print_motd("/run/motd.dynamic")) {
-	print_motd("/var/run/motd.dynamic");
+  print_motd("/var/run/motd.dynamic");
       }
       // Always print traditional /etc/motd.
       print_motd("/etc/motd");
@@ -587,32 +633,41 @@ static int run_server( const char *desired_ip, const char *desired_port,
   } else {
     /* parent */
 
+    /* reenable signals */
+    struct sigaction sa;
+    sa.sa_handler = SIG_DFL;
+    sa.sa_flags = 0;
+    fatal_assert( 0 == sigfillset( &sa.sa_mask ) );
+    fatal_assert( 0 == sigaction( SIGCHLD, &sa, NULL ) );
+
     /* Drop unnecessary privileges */
+		/*
 #ifdef HAVE_PLEDGE
-    /* OpenBSD pledge() syscall */
+    // OpenBSD pledge() syscall
     if ( pledge( "stdio inet tty", NULL )) {
       perror( "pledge() failed" );
       exit( 1 );
     }
 #endif
+		*/
 
 #ifdef HAVE_UTEMPTER
     /* make utmp entry */
-    utempter_add_record( master, utmp_entry );
+    //utempter_add_record( master, utmp_entry );
 #endif
 
     try {
       serve( master, terminal, *network, network_timeout, network_signaled_timeout );
     } catch ( const Network::NetworkException &e ) {
       fprintf( stderr, "Network exception: %s\n",
-	       e.what() );
+         e.what() );
     } catch ( const Crypto::CryptoException &e ) {
       fprintf( stderr, "Crypto exception: %s\n",
-	       e.what() );
+         e.what() );
     }
 
     #ifdef HAVE_UTEMPTER
-    utempter_remove_record( master );
+    //utempter_remove_record( master );
     #endif
 
     if ( close( master ) < 0 ) {
@@ -641,12 +696,14 @@ static void serve( int host_fd, Terminal::Complete &terminal, ServerConnection &
 
   uint64_t last_remote_num = network.get_remote_state_num();
 
+	/*
   #ifdef HAVE_UTEMPTER
   bool connected_utmp = false;
 
   Addr saved_addr;
   socklen_t saved_addr_len = 0;
   #endif
+	*/
 
   bool child_released = false;
 
@@ -659,7 +716,7 @@ static void serve( int host_fd, Terminal::Complete &terminal, ServerConnection &
       timeout = min( timeout, network.wait_time() );
       timeout = min( timeout, terminal.wait_time( now ) );
       if ( (!network.get_remote_state_num())
-	   || network.shutdown_in_progress() ) {
+     || network.shutdown_in_progress() ) {
         timeout = min( timeout, 5000 );
       }
       /*
@@ -667,15 +724,15 @@ static void serve( int host_fd, Terminal::Complete &terminal, ServerConnection &
        * We may want to wake up sooner.
        */
       if ( network_timeout_ms ) {
-	int64_t network_sleep = network_timeout_ms -
-	  ( now - network.get_latest_remote_state().timestamp );
-	if ( network_sleep < 0 ) {
-	  network_sleep = 0;
-	} else if ( network_sleep > INT_MAX ) {
-	  /* 24 days might be too soon.  That's OK. */
-	  network_sleep = INT_MAX;
-	}
-	timeout = min( timeout, static_cast<int>(network_sleep) );
+  int64_t network_sleep = network_timeout_ms -
+    ( now - network.get_latest_remote_state().timestamp );
+  if ( network_sleep < 0 ) {
+    network_sleep = 0;
+  } else if ( network_sleep > INT_MAX ) {
+    /* 24 days might be too soon.  That's OK. */
+    network_sleep = INT_MAX;
+  }
+  timeout = min( timeout, static_cast<int>(network_sleep) );
       }
 
       /* poll for events */
@@ -685,13 +742,13 @@ static void serve( int host_fd, Terminal::Complete &terminal, ServerConnection &
       int network_fd = fd_list.back();
       sel.add_fd( network_fd );
       if ( !network.shutdown_in_progress() ) {
-	sel.add_fd( host_fd );
+  sel.add_fd( host_fd );
       }
 
       int active_fds = sel.select( timeout );
       if ( active_fds < 0 ) {
-	perror( "select" );
-	break;
+  perror( "select" );
+  break;
       }
 
       now = Network::timestamp();
@@ -699,174 +756,178 @@ static void serve( int host_fd, Terminal::Complete &terminal, ServerConnection &
       string terminal_to_host;
 
       if ( sel.read( network_fd ) ) {
-	/* packet received from the network */
-	network.recv();
-	
-	/* is new user input available for the terminal? */
-	if ( network.get_remote_state_num() != last_remote_num ) {
-	  last_remote_num = network.get_remote_state_num();
+  /* packet received from the network */
+  network.recv();
 
-	  
-	  Network::UserStream us;
-	  us.apply_string( network.get_remote_diff() );
-	  /* apply userstream to terminal */
-	  for ( size_t i = 0; i < us.size(); i++ ) {
-	    const Parser::Action *action = us.get_action( i );
-	    if ( typeid( *action ) == typeid( Parser::Resize ) ) {
-	      /* apply only the last consecutive Resize action */
-	      while ( i < us.size() - 1 &&
-		   typeid( us.get_action( i + 1 ) ) == typeid( Parser::Resize ) ) {
-		i++;
-	      }
-	      /* tell child process of resize */
-	      const Parser::Resize *res = static_cast<const Parser::Resize *>( action );
-	      struct winsize window_size;
-	      if ( ioctl( host_fd, TIOCGWINSZ, &window_size ) < 0 ) {
-		perror( "ioctl TIOCGWINSZ" );
-		network.start_shutdown();
-	      }
-	      window_size.ws_col = res->width;
-	      window_size.ws_row = res->height;
-	      if ( ioctl( host_fd, TIOCSWINSZ, &window_size ) < 0 ) {
-		perror( "ioctl TIOCSWINSZ" );
-		network.start_shutdown();
-	      }
-	    }
-	    terminal_to_host += terminal.act( action );
-	  }
+  /* is new user input available for the terminal? */
+  if ( network.get_remote_state_num() != last_remote_num ) {
+    last_remote_num = network.get_remote_state_num();
 
-	  if ( !us.empty() ) {
-	    /* register input frame number for future echo ack */
-	    terminal.register_input_frame( last_remote_num, now );
-	  }
 
-	  /* update client with new state of terminal */
-	  if ( !network.shutdown_in_progress() ) {
-	    network.set_current_state( terminal );
-	  }
-	  
-	  #ifdef HAVE_UTEMPTER
-	  /* update utmp entry if we have become "connected" */
-	  if ( (!connected_utmp)
-	       || saved_addr_len != network.get_remote_addr_len()
-	       || memcmp( &saved_addr, &network.get_remote_addr(),
-			  saved_addr_len ) != 0 ) {
-	    utempter_remove_record( host_fd );
-
-	    saved_addr = network.get_remote_addr();
-	    saved_addr_len = network.get_remote_addr_len();
-
-	    char host[ NI_MAXHOST ];
-	    int errcode = getnameinfo( &saved_addr.sa, saved_addr_len,
-				       host, sizeof( host ), NULL, 0,
-				       NI_NUMERICHOST );
-	    if ( errcode != 0 ) {
-	      throw NetworkException( std::string( "serve: getnameinfo: " ) + gai_strerror( errcode ), 0 );
-	    }
-
-	    char tmp[ 64 ];
-	    snprintf( tmp, 64, "%s via mosh [%d]", host, getpid() );
-	    utempter_add_record( host_fd, tmp );
-
-	    connected_utmp = true;
-	  }
-	  #endif
-
-	  /* Tell child to start login session. */
-	  if ( !child_released ) {
-	    if ( swrite( host_fd, "\n", 1 ) < 0) {
-	      perror( "child release" );
-	      _exit( 1 );
-	    }
-	    child_released = true;
-	  }
-	}
+    Network::UserStream us;
+    us.apply_string( network.get_remote_diff() );
+    /* apply userstream to terminal */
+    for ( size_t i = 0; i < us.size(); i++ ) {
+      const Parser::Action *action = us.get_action( i );
+      if ( typeid( *action ) == typeid( Parser::Resize ) ) {
+        /* apply only the last consecutive Resize action */
+        while ( i < us.size() - 1 &&
+       typeid( us.get_action( i + 1 ) ) == typeid( Parser::Resize ) ) {
+    i++;
+        }
+        /* tell child process of resize */
+        const Parser::Resize *res = static_cast<const Parser::Resize *>( action );
+        struct winsize window_size;
+        if ( ioctl( host_fd, TIOCGWINSZ, &window_size ) < 0 ) {
+    perror( "ioctl TIOCGWINSZ" );
+    network.start_shutdown();
+        }
+        window_size.ws_col = res->width;
+        window_size.ws_row = res->height;
+        if ( ioctl( host_fd, TIOCSWINSZ, &window_size ) < 0 ) {
+    perror( "ioctl TIOCSWINSZ" );
+    network.start_shutdown();
+        }
       }
-      
+      terminal_to_host += terminal.act( action );
+    }
+
+    if ( !us.empty() ) {
+      /* register input frame number for future echo ack */
+      terminal.register_input_frame( last_remote_num, now );
+    }
+
+    /* update client with new state of terminal */
+    if ( !network.shutdown_in_progress() ) {
+      network.set_current_state( terminal );
+    }
+
+		/*
+    #ifdef HAVE_UTEMPTER
+    // update utmp entry if we have become "connected"
+    if ( (!connected_utmp)
+         || saved_addr_len != network.get_remote_addr_len()
+         || memcmp( &saved_addr, &network.get_remote_addr(),
+        saved_addr_len ) != 0 ) {
+      utempter_remove_record( host_fd );
+
+      saved_addr = network.get_remote_addr();
+      saved_addr_len = network.get_remote_addr_len();
+
+      char host[ NI_MAXHOST ];
+      int errcode = getnameinfo( &saved_addr.sa, saved_addr_len,
+               host, sizeof( host ), NULL, 0,
+               NI_NUMERICHOST );
+      if ( errcode != 0 ) {
+        throw NetworkException( std::string( "serve: getnameinfo: " ) + gai_strerror( errcode ), 0 );
+      }
+
+      char tmp[ 64 ];
+      snprintf( tmp, 64, "%s via mosh [%d]", host, getpid() );
+      utempter_add_record( host_fd, tmp );
+
+      connected_utmp = true;
+    }
+    #endif
+		*/
+
+    /* Tell child to start login session. */
+    if ( !child_released ) {
+      if ( swrite( host_fd, "\n", 1 ) < 0) {
+        perror( "child release" );
+        _exit( 1 );
+      }
+      child_released = true;
+    }
+  }
+      }
+
       if ( (!network.shutdown_in_progress()) && sel.read( host_fd ) ) {
-	/* input from the host needs to be fed to the terminal */
-	const int buf_size = 16384;
-	char buf[ buf_size ];
-	
-	/* fill buffer if possible */
-	ssize_t bytes_read = read( host_fd, buf, buf_size );
+  /* input from the host needs to be fed to the terminal */
+  const int buf_size = 16384;
+  char buf[ buf_size ];
+
+  /* fill buffer if possible */
+  ssize_t bytes_read = read( host_fd, buf, buf_size );
 
         /* If the pty slave is closed, reading from the master can fail with
            EIO (see #264).  So we treat errors on read() like EOF. */
         if ( bytes_read <= 0 ) {
-	  network.start_shutdown();
-	} else {
-	  terminal_to_host += terminal.act( string( buf, bytes_read ) );
-	
-	  /* update client with new state of terminal */
-	  network.set_current_state( terminal );
-	}
+    network.start_shutdown();
+  } else {
+    terminal_to_host += terminal.act( string( buf, bytes_read ) );
+
+    /* update client with new state of terminal */
+    network.set_current_state( terminal );
+  }
       }
 
       /* write user input and terminal writeback to the host */
       if ( swrite( host_fd, terminal_to_host.c_str(), terminal_to_host.length() ) < 0 ) {
-	network.start_shutdown();
+  network.start_shutdown();
       }
 
       bool idle_shutdown = false;
       if ( network_timeout_ms &&
-	   network_timeout_ms <= time_since_remote_state ) {
-	idle_shutdown = true;
-	fprintf( stderr, "Network idle for %llu seconds.\n", 
-		 static_cast<unsigned long long>( time_since_remote_state / 1000 ) );
+     network_timeout_ms <= time_since_remote_state ) {
+  idle_shutdown = true;
+  fprintf( stderr, "Network idle for %llu seconds.\n",
+     static_cast<unsigned long long>( time_since_remote_state / 1000 ) );
       }
       if ( sel.signal( SIGUSR1 ) ) {
-	if ( !network_signaled_timeout_ms || network_signaled_timeout_ms <= time_since_remote_state ) {
-	  idle_shutdown = true;
-	  fprintf( stderr, "Network idle for %llu seconds when SIGUSR1 received\n",
-		   static_cast<unsigned long long>( time_since_remote_state / 1000 ) );
-	}
+  if ( !network_signaled_timeout_ms || network_signaled_timeout_ms <= time_since_remote_state ) {
+    idle_shutdown = true;
+    fprintf( stderr, "Network idle for %llu seconds when SIGUSR1 received\n",
+       static_cast<unsigned long long>( time_since_remote_state / 1000 ) );
+  }
       }
 
       if ( sel.any_signal() || idle_shutdown ) {
-	/* shutdown signal */
-	if ( network.has_remote_addr() && (!network.shutdown_in_progress()) ) {
-	  network.start_shutdown();
-	} else {
-	  break;
-	}
+  /* shutdown signal */
+  if ( network.has_remote_addr() && (!network.shutdown_in_progress()) ) {
+    network.start_shutdown();
+  } else {
+    break;
+  }
       }
-      
+
       /* quit if our shutdown has been acknowledged */
       if ( network.shutdown_in_progress() && network.shutdown_acknowledged() ) {
-	break;
+  break;
       }
 
       /* quit after shutdown acknowledgement timeout */
       if ( network.shutdown_in_progress() && network.shutdown_ack_timed_out() ) {
-	break;
+  break;
       }
 
       /* quit if we received and acknowledged a shutdown request */
       if ( network.counterparty_shutdown_ack_sent() ) {
-	break;
+  break;
       }
 
+			/*
       #ifdef HAVE_UTEMPTER
-      /* update utmp if has been more than 30 seconds since heard from client */
+      // update utmp if has been more than 30 seconds since heard from client
       if ( connected_utmp ) {
-	if ( time_since_remote_state > 30000 ) {
-	  utempter_remove_record( host_fd );
+  if ( time_since_remote_state > 30000 ) {
+    utempter_remove_record( host_fd );
 
-	  char tmp[ 64 ];
-	  snprintf( tmp, 64, "mosh [%d]", getpid() );
-	  utempter_add_record( host_fd, tmp );
+    char tmp[ 64 ];
+    snprintf( tmp, 64, "mosh [%d]", getpid() );
+    utempter_add_record( host_fd, tmp );
 
-	  connected_utmp = false;
-	}
+    connected_utmp = false;
+  }
       }
       #endif
+			*/
 
       if ( terminal.set_echo_ack( now ) ) {
-	/* update client with new echo ack */
-	if ( !network.shutdown_in_progress() ) {
-	  network.set_current_state( terminal );
-	}
+  /* update client with new echo ack */
+  if ( !network.shutdown_in_progress() ) {
+    network.set_current_state( terminal );
+  }
       }
 
       if ( !network.get_remote_state_num()
@@ -969,15 +1030,15 @@ static void warn_unattached( const string & ignore_entry )
 
   while ( struct utmpx *entry = getutxent() ) {
     if ( (entry->ut_type == USER_PROCESS)
-	 && (username == string( entry->ut_user )) ) {
+   && (username == string( entry->ut_user )) ) {
       /* does line show unattached mosh session */
       string text( entry->ut_host );
       if ( (text.size() >= 5)
-	   && (text.substr( 0, 5 ) == "mosh ")
-	   && (text[ text.size() - 1 ] == ']')
-	   && (text != ignore_entry)
-	   && device_exists( entry->ut_line ) ) {
-	unattached_mosh_servers.push_back( text );
+     && (text.substr( 0, 5 ) == "mosh ")
+     && (text[ text.size() - 1 ] == ']')
+     && (text != ignore_entry)
+     && device_exists( entry->ut_line ) ) {
+  unattached_mosh_servers.push_back( text );
       }
     }
   }
@@ -987,18 +1048,18 @@ static void warn_unattached( const string & ignore_entry )
     return;
   } else if ( unattached_mosh_servers.size() == 1 ) {
     printf( "\033[37;44mMosh: You have a detached Mosh session on this server (%s).\033[m\n\n",
-	    unattached_mosh_servers.front().c_str() );
+      unattached_mosh_servers.front().c_str() );
   } else {
     string pid_string;
 
     for ( vector< string >::const_iterator it = unattached_mosh_servers.begin();
-	  it != unattached_mosh_servers.end();
-	  it++ ) {
+    it != unattached_mosh_servers.end();
+    it++ ) {
       pid_string += "        - " + *it + "\n";
     }
 
     printf( "\033[37;44mMosh: You have %d detached Mosh sessions on this server, with PIDs:\n%s\033[m\n",
-	    (int)unattached_mosh_servers.size(), pid_string.c_str() );
+      (int)unattached_mosh_servers.size(), pid_string.c_str() );
   }
 #endif /* HAVE_UTMPX_H */
 }

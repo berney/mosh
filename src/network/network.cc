@@ -238,7 +238,7 @@ Connection::Connection( const char *desired_ip, const char *desired_port ) /* se
     remote_addr_len( 0 ),
     server( true ),
     MTU( DEFAULT_SEND_MTU ),
-    key(),
+    key("9jldjHQzt41rxjPXnoO1lQ"),
     session( key ),
     direction( TO_CLIENT ),
     saved_timestamp( -1 ),
@@ -555,7 +555,7 @@ string Connection::recv_one( int sock_to_recv, bool nonblocking )
 	} else {
 	  const double alpha = 1.0 / 8.0;
 	  const double beta = 1.0 / 4.0;
-	  
+
 	  RTTVAR = (1 - beta) * RTTVAR + ( beta * fabs( SRTT - R ) );
 	  SRTT = (1 - alpha) * SRTT + ( alpha * R );
 	}
@@ -627,7 +627,7 @@ uint16_t Network::timestamp_diff( uint16_t tsnew, uint16_t tsold )
   if ( diff < 0 ) {
     diff += 65536;
   }
-  
+
   assert( diff >= 0 );
   assert( diff <= 65535 );
 
